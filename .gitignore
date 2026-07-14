@@ -1,0 +1,16 @@
+# Python virtualenv
+.venv/
+venv/
+
+# Python caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# OS / editor
+.DS_Store
+.claude/settings.local.json
+
+# Local scratch
+/tmp/
+*.b64
