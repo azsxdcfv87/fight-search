@@ -40,6 +40,7 @@ CURRENCY = "TWD"
 THRESHOLD = int(os.environ.get("PRICE_THRESHOLD", "13000"))  # 最低來回合計(全體乘客) <= 此值才推播
 # ALWAYS_POST=1 → 每次都推（未達門檻走正常推播）；預設 0 → 只有達門檻才推，未達安靜略過
 ALWAYS_POST = os.environ.get("ALWAYS_POST", "0").strip() in ("1", "true", "True")
+TOP_N = int(os.environ.get("TOP_N", "7"))  # 訊息最多列出幾家（依來回合計由低到高）
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "").strip()
 
 # 廉航 / 傳統航空 關鍵字（用於判斷行李慣例，非即時資料）
@@ -249,7 +250,7 @@ def build_slack_payload(pairs: list[RoundTrip]) -> dict:
         )
 
     lines = [head, f"_{dates}・經濟艙・{pax}・金額為全體乘客來回合計_", ""]
-    for i, rt in enumerate(pairs[:5], 1):
+    for i, rt in enumerate(pairs[:TOP_N], 1):
         tag = f"〈{rt.tag}〉" if rt.tag else ""
         pp = f"（每人 NT${_per_person(rt.total):,}）" if PASSENGERS > 1 else ""
         lines.append(f"{i}. *NT${rt.total:,}* — {rt.airline}{tag}{pp}")
