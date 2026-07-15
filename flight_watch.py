@@ -31,7 +31,9 @@ RETURN_DATE = "2027-03-07"
 FROM_AIRPORT = "TPE"   # 桃園
 TO_AIRPORT = "PUS"     # 釜山金海
 CURRENCY = "TWD"
-THRESHOLD = int(os.environ.get("PRICE_THRESHOLD", "8000"))
+THRESHOLD = int(os.environ.get("PRICE_THRESHOLD", "6500"))  # 最低來回總價 <= 此值才推播
+# ALWAYS_POST=1 → 每次都推（未達門檻走正常推播）；預設 0 → 只有達門檻才推，未達安靜略過
+ALWAYS_POST = os.environ.get("ALWAYS_POST", "0").strip() in ("1", "true", "True")
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "").strip()
 
 # 廉航 / 傳統航空 關鍵字（用於判斷行李慣例，非即時資料）
@@ -193,12 +195,12 @@ def build_slack_payload(outbound: list[Itinerary], inbound: list[Itinerary]) -> 
         return {"text": f":warning: [{route}] {dates} 這次沒抓到任何票價（可能來源改版或暫時無結果）。"}
 
     cheapest = outbound[0]
-    hit = cheapest.price < THRESHOLD
+    hit = cheapest.price <= THRESHOLD
     ctag = f"〈{cheapest.carrier_tag}〉" if cheapest.carrier_tag else ""
 
     if hit:
         header = (
-            f":airplane: <!channel> *[{route}] 出現低於 NT${THRESHOLD:,} 的來回票！*\n"
+            f":airplane: <!channel> *[{route}] 出現 NT${THRESHOLD:,} 以下的來回票！*\n"
             f"最低來回總價 *NT${cheapest.price:,}* — {cheapest.airline_label}{ctag}"
         )
     else:
@@ -259,7 +261,16 @@ def main() -> int:
         post_to_slack({"text": f":x: 機票監控執行失敗：{type(e).__name__}: {e}"})
         print(f"ERROR: {e}", file=sys.stderr)
         return 1
-    post_to_slack(build_slack_payload(outbound, inbound))
+
+    if not outbound:  # 沒抓到任何結果 → 推警告（可能來源改版）
+        post_to_slack(build_slack_payload(outbound, inbound))
+        return 0
+
+    cheapest = outbound[0]
+    if cheapest.price <= THRESHOLD or ALWAYS_POST:
+        post_to_slack(build_slack_payload(outbound, inbound))
+    else:  # 未達門檻且非 ALWAYS_POST → 安靜略過，只留 log
+        print(f"[skip] 最低來回總價 NT${cheapest.price:,} > 門檻 NT${THRESHOLD:,}，不推播")
     return 0
 
 
