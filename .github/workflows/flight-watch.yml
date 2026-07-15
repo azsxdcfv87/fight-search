@@ -1,0 +1,30 @@
+name: flight-watch
+
+# 每小時整點跑一次（cron 為 UTC；因台北為 UTC+8 整數時差，台北同樣落在整點）
+# 也可在 Actions 頁面用 "Run workflow" 手動觸發
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install --quiet fast-flights typing_extensions
+
+      - name: Run flight watch
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          PRICE_THRESHOLD: "13000"   # 最低來回合計(2人) <= 此值才 @channel
+          PASSENGERS: "2"            # 乘客人數
+          ALWAYS_POST: "1"           # 每小時都推一則（未達門檻走正常推播）
+          TOP_N: "7"                 # 最多列幾家
+        run: python flight_watch.py
