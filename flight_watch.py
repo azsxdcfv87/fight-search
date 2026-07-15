@@ -25,11 +25,15 @@ from dataclasses import dataclass
 from fast_flights import create_query, fetch_flights_html, FlightQuery, Passengers
 from selectolax.lexbor import LexborHTMLParser
 
-# ---- 搜尋條件 -------------------------------------------------------------
-DEPART_DATE = "2027-03-03"
-RETURN_DATE = "2027-03-07"
-FROM_AIRPORT = "TPE"   # 桃園
-TO_AIRPORT = "PUS"     # 釜山金海
+# ═══════════════════ 搜尋設定（要改路線 / 日期，改這 4 行即可）═══════════════════
+# 機場代碼範例：台北桃園 TPE、台北松山 TSA、釜山 PUS、首爾仁川 ICN、
+#              東京成田 NRT、大阪關西 KIX、香港 HKG、曼谷 BKK
+FROM_AIRPORT = os.environ.get("FROM_AIRPORT", "TPE")        # ① 出發地點（去程從這裡起飛）
+TO_AIRPORT   = os.environ.get("TO_AIRPORT",   "PUS")        # ② 回程地點（目的地；回程從這裡飛回）
+DEPART_DATE  = os.environ.get("DEPART_DATE",  "2027-03-03")  # ③ 出發日期（去程），格式 YYYY-MM-DD
+RETURN_DATE  = os.environ.get("RETURN_DATE",  "2027-03-07")  # ④ 回程日期，        格式 YYYY-MM-DD
+# ══════════════════════════════════════════════════════════════════════════════
+
 CURRENCY = "TWD"
 THRESHOLD = int(os.environ.get("PRICE_THRESHOLD", "6500"))  # 最低來回總價 <= 此值才推播
 # ALWAYS_POST=1 → 每次都推（未達門檻走正常推播）；預設 0 → 只有達門檻才推，未達安靜略過
