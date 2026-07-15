@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
-"""監控 台北(TPE)→釜山(PUS) 來回機票，最低來回票價 < 門檻時 Slack 標記頻道。
+"""監控 台北(TPE)↔釜山(PUS) 來回機票，最低來回合計 <= 門檻時 Slack 標記頻道。
 
 資料來源：Google Flights（透過 fast-flights 取 HTML，內建 parser 已與 Google 改版脫節，
 故此處自帶容錯解析器）。
 
-顯示：
-  - 去程 TPE→PUS：以「來回總價」排序（Google 來回搜尋只回傳去程班次 + 來回總價）。
-  - 回程 PUS→TPE：另打一次單程搜尋，補上回程班次的起飛/抵達時間（參考時段）。
-  - 每家航空標註 廉航 / 傳統，底部附行李提示（清單頁無逐筆行李資料，只能依航司類型提示）。
+做法：去程、回程各搜一次「單程」，再依航空公司把「同一家的去程 + 回程」配成一筆，
+顯示各自起飛→抵達時間與「去價 + 回價 = 來回合計」（價格為全體乘客總價）。
+對廉航（一次買單程）這即實付金額；傳統航空的來回套票可能更便宜，以訂票頁為準。
 
 環境變數：
   SLACK_WEBHOOK_URL   Slack Incoming Webhook（未設定時走 dry-run，只印在 stdout）
-  PRICE_THRESHOLD     觸發標記頻道的門檻，預設 8000
+  PRICE_THRESHOLD     最低來回合計 <= 此值才推播
+  ALWAYS_POST         1 → 每次都推；0（預設）→ 只有達門檻才推
+  FROM_AIRPORT / TO_AIRPORT / DEPART_DATE / RETURN_DATE / PASSENGERS  可覆蓋搜尋設定
 """
 
 from __future__ import annotations
@@ -25,17 +26,18 @@ from dataclasses import dataclass
 from fast_flights import create_query, fetch_flights_html, FlightQuery, Passengers
 from selectolax.lexbor import LexborHTMLParser
 
-# ═══════════════════ 搜尋設定（要改路線 / 日期，改這 4 行即可）═══════════════════
+# ═══════════════ 搜尋設定（要改路線 / 日期 / 人數，改這裡即可）═══════════════
 # 機場代碼範例：台北桃園 TPE、台北松山 TSA、釜山 PUS、首爾仁川 ICN、
 #              東京成田 NRT、大阪關西 KIX、香港 HKG、曼谷 BKK
 FROM_AIRPORT = os.environ.get("FROM_AIRPORT", "TPE")        # ① 出發地點（去程從這裡起飛）
 TO_AIRPORT   = os.environ.get("TO_AIRPORT",   "PUS")        # ② 回程地點（目的地；回程從這裡飛回）
 DEPART_DATE  = os.environ.get("DEPART_DATE",  "2027-03-03")  # ③ 出發日期（去程），格式 YYYY-MM-DD
 RETURN_DATE  = os.environ.get("RETURN_DATE",  "2027-03-07")  # ④ 回程日期，        格式 YYYY-MM-DD
+PASSENGERS   = int(os.environ.get("PASSENGERS", "2"))       # ⑤ 乘客人數（成人）
 # ══════════════════════════════════════════════════════════════════════════════
 
 CURRENCY = "TWD"
-THRESHOLD = int(os.environ.get("PRICE_THRESHOLD", "6500"))  # 最低來回總價 <= 此值才推播
+THRESHOLD = int(os.environ.get("PRICE_THRESHOLD", "13000"))  # 最低來回合計(全體乘客) <= 此值才推播
 # ALWAYS_POST=1 → 每次都推（未達門檻走正常推播）；預設 0 → 只有達門檻才推，未達安靜略過
 ALWAYS_POST = os.environ.get("ALWAYS_POST", "0").strip() in ("1", "true", "True")
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "").strip()
@@ -54,6 +56,14 @@ FSC_KEYWORDS = [
 ]
 
 
+def carrier_tag(name: str) -> str:
+    if any(k in name for k in LCC_KEYWORDS):
+        return "廉航"
+    if any(k in name for k in FSC_KEYWORDS):
+        return "傳統"
+    return ""
+
+
 @dataclass
 class Itinerary:
     airlines: list[str]
@@ -66,15 +76,6 @@ class Itinerary:
     @property
     def airline_label(self) -> str:
         return " / ".join(self.airlines) if self.airlines else "未知航空"
-
-    @property
-    def carrier_tag(self) -> str:
-        name = self.airline_label
-        if any(k in name for k in LCC_KEYWORDS):
-            return "廉航"
-        if any(k in name for k in FSC_KEYWORDS):
-            return "傳統"
-        return ""
 
     @property
     def stops_label(self) -> str:
@@ -91,6 +92,29 @@ class Itinerary:
         if self.depart_time and self.arrive_time:
             return f"{self.depart_time}→{self.arrive_time}"
         return self.depart_time or self.arrive_time
+
+    @property
+    def detail(self) -> str:
+        return " · ".join(x for x in [self.time_label, self.stops_label, self.duration_label] if x)
+
+
+@dataclass
+class RoundTrip:
+    """同一家航空的去程 + 回程配成一筆來回。"""
+    outbound: Itinerary
+    inbound: Itinerary
+
+    @property
+    def airline(self) -> str:
+        return self.outbound.airline_label
+
+    @property
+    def tag(self) -> str:
+        return carrier_tag(self.airline)
+
+    @property
+    def total(self) -> int:
+        return self.outbound.price + self.inbound.price
 
 
 def _safe(seq, *idx):
@@ -152,7 +176,7 @@ def parse_itineraries(html: str) -> list[Itinerary]:
             it = _parse_entry(k)
             if it is not None:
                 results.append(it)
-    # 依 (航空, 價格, 出發時間) 去重
+    # 依 (航空, 價格, 出發時間) 去重，並依價格由低到高排序
     seen, deduped = set(), []
     for it in sorted(results, key=lambda x: x.price):
         key = (it.airline_label, it.price, it.depart_time)
@@ -162,71 +186,64 @@ def parse_itineraries(html: str) -> list[Itinerary]:
     return deduped
 
 
-def fetch_roundtrip() -> list[Itinerary]:
-    """來回搜尋 → 去程班次（價格為來回總價）。"""
-    query = create_query(
-        flights=[
-            FlightQuery(date=DEPART_DATE, from_airport=FROM_AIRPORT, to_airport=TO_AIRPORT),
-            FlightQuery(date=RETURN_DATE, from_airport=TO_AIRPORT, to_airport=FROM_AIRPORT),
-        ],
-        trip="round-trip", seat="economy", passengers=Passengers(adults=1),
-        language="zh-TW", currency=CURRENCY,
-    )
-    return parse_itineraries(fetch_flights_html(query))
-
-
 def fetch_oneway(date: str, frm: str, to: str) -> list[Itinerary]:
-    """單程搜尋 → 該方向班次（價格為單程價，主要拿來補時段）。"""
+    """單程搜尋 → 該方向班次（價格為全體乘客總價，已依價格排序）。"""
     query = create_query(
         flights=[FlightQuery(date=date, from_airport=frm, to_airport=to)],
-        trip="one-way", seat="economy", passengers=Passengers(adults=1),
+        trip="one-way", seat="economy", passengers=Passengers(adults=PASSENGERS),
         language="zh-TW", currency=CURRENCY,
     )
     return parse_itineraries(fetch_flights_html(query))
 
 
-def _fmt_line(it: Itinerary, *, show_price: bool) -> str:
-    tag = f"〈{it.carrier_tag}〉" if it.carrier_tag else ""
-    extras = " · ".join(x for x in [it.stops_label, it.duration_label, it.time_label] if x)
-    head = f"*NT${it.price:,}* — " if show_price else ""
-    return f"{head}{it.airline_label}{tag}" + (f"（{extras}）" if extras else "")
+def _cheapest_by_airline(items: list[Itinerary]) -> dict[str, Itinerary]:
+    """items 已依價格排序 → 每家航空取第一筆（最便宜）。"""
+    best: dict[str, Itinerary] = {}
+    for it in items:
+        best.setdefault(it.airline_label, it)
+    return best
 
 
-def build_slack_payload(outbound: list[Itinerary], inbound: list[Itinerary]) -> dict:
+def pair_roundtrips(outbound: list[Itinerary], inbound: list[Itinerary]) -> list[RoundTrip]:
+    """把同一家航空的最便宜去程與最便宜回程配成來回，依來回合計排序。"""
+    best_out = _cheapest_by_airline(outbound)
+    best_in = _cheapest_by_airline(inbound)
+    pairs = [RoundTrip(best_out[a], best_in[a]) for a in best_out if a in best_in]
+    pairs.sort(key=lambda p: p.total)
+    return pairs
+
+
+def build_slack_payload(pairs: list[RoundTrip]) -> dict:
     route = f"{FROM_AIRPORT}↔{TO_AIRPORT}"
     dates = f"{DEPART_DATE} 去 / {RETURN_DATE} 回"
-    if not outbound:
-        return {"text": f":warning: [{route}] {dates} 這次沒抓到任何票價（可能來源改版或暫時無結果）。"}
+    pax = f"{PASSENGERS} 位成人"
+    if not pairs:
+        return {"text": f":warning: [{route}] {dates} 這次沒配對到任何來回（可能來源改版或暫時無結果）。"}
 
-    cheapest = outbound[0]
-    hit = cheapest.price <= THRESHOLD
-    ctag = f"〈{cheapest.carrier_tag}〉" if cheapest.carrier_tag else ""
+    cheapest = pairs[0]
+    hit = cheapest.total <= THRESHOLD
+    ctag = f"〈{cheapest.tag}〉" if cheapest.tag else ""
 
     if hit:
-        header = (
+        head = (
             f":airplane: <!channel> *[{route}] 出現 NT${THRESHOLD:,} 以下的來回票！*\n"
-            f"最低來回總價 *NT${cheapest.price:,}* — {cheapest.airline_label}{ctag}"
+            f"最低來回合計 *NT${cheapest.total:,}* — {cheapest.airline}{ctag}"
         )
     else:
-        header = (
+        head = (
             f":airplane: [{route}] 來回機票監控\n"
-            f"目前最低來回總價 *NT${cheapest.price:,}* — {cheapest.airline_label}{ctag}"
+            f"目前最低來回合計 *NT${cheapest.total:,}* — {cheapest.airline}{ctag}"
         )
 
-    lines = [header, f"_{dates}・經濟艙・1 位成人_", ""]
-
-    lines.append(f":small_orange_diamond: *去程 {FROM_AIRPORT}→{TO_AIRPORT}｜{DEPART_DATE}*（金額為來回總價）")
-    for i, it in enumerate(outbound[:5], 1):
-        lines.append(f"{i}. {_fmt_line(it, show_price=True)}")
-
-    if inbound:
-        lines.append("")
-        lines.append(f":small_blue_diamond: *回程 {TO_AIRPORT}→{FROM_AIRPORT}｜{RETURN_DATE}*（參考時段）")
-        for it in inbound[:4]:
-            lines.append(f"• {_fmt_line(it, show_price=False)}")
+    lines = [head, f"_{dates}・經濟艙・{pax}・金額為全體乘客來回合計_", ""]
+    for i, rt in enumerate(pairs[:5], 1):
+        tag = f"〈{rt.tag}〉" if rt.tag else ""
+        lines.append(f"{i}. *NT${rt.total:,}* — {rt.airline}{tag}")
+        lines.append(f"      去 {rt.outbound.detail}（NT${rt.outbound.price:,}）")
+        lines.append(f"      回 {rt.inbound.detail}（NT${rt.inbound.price:,}）")
 
     lines.append("")
-    lines.append("_※ 行李：廉航票價多為僅手提、託運需另購；傳統航空通常含 1 件託運。實際以訂票頁為準。_")
+    lines.append("_※ 合計＝去程單程＋回程單程（廉航一次買單程即實付；傳統航空來回套票可能更便宜）。行李以訂票頁為準。_")
 
     gf_url = (
         "https://www.google.com/travel/flights?q="
@@ -255,26 +272,23 @@ def post_to_slack(payload: dict) -> None:
 
 def main() -> int:
     try:
-        outbound = fetch_roundtrip()
-        try:
-            inbound = fetch_oneway(RETURN_DATE, TO_AIRPORT, FROM_AIRPORT)
-        except Exception as e:  # 回程只是補充資訊，失敗不影響主流程
-            print(f"WARN: 回程查詢失敗（略過）：{e}", file=sys.stderr)
-            inbound = []
-    except Exception as e:  # 主抓取失敗也推一則，避免默默失效
+        outbound = fetch_oneway(DEPART_DATE, FROM_AIRPORT, TO_AIRPORT)
+        inbound = fetch_oneway(RETURN_DATE, TO_AIRPORT, FROM_AIRPORT)
+    except Exception as e:  # 抓取失敗也推一則，避免默默失效
         post_to_slack({"text": f":x: 機票監控執行失敗：{type(e).__name__}: {e}"})
         print(f"ERROR: {e}", file=sys.stderr)
         return 1
 
-    if not outbound:  # 沒抓到任何結果 → 推警告（可能來源改版）
-        post_to_slack(build_slack_payload(outbound, inbound))
+    pairs = pair_roundtrips(outbound, inbound)
+    if not pairs:  # 沒配對到 → 推警告（可能來源改版）
+        post_to_slack(build_slack_payload(pairs))
         return 0
 
-    cheapest = outbound[0]
-    if cheapest.price <= THRESHOLD or ALWAYS_POST:
-        post_to_slack(build_slack_payload(outbound, inbound))
+    cheapest = pairs[0]
+    if cheapest.total <= THRESHOLD or ALWAYS_POST:
+        post_to_slack(build_slack_payload(pairs))
     else:  # 未達門檻且非 ALWAYS_POST → 安靜略過，只留 log
-        print(f"[skip] 最低來回總價 NT${cheapest.price:,} > 門檻 NT${THRESHOLD:,}，不推播")
+        print(f"[skip] 最低來回合計 NT${cheapest.total:,} > 門檻 NT${THRESHOLD:,}，不推播")
     return 0
 
 
