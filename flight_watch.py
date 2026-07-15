@@ -213,6 +213,18 @@ def pair_roundtrips(outbound: list[Itinerary], inbound: list[Itinerary]) -> list
     return pairs
 
 
+def _per_person(total: int) -> int:
+    """全體乘客總價 → 每人單價。"""
+    return round(total / PASSENGERS) if PASSENGERS else total
+
+
+def _price_str(total: int) -> str:
+    """價格字串；多人時附註每人單價。"""
+    if PASSENGERS > 1:
+        return f"NT${total:,}，每人 NT${_per_person(total):,}"
+    return f"NT${total:,}"
+
+
 def build_slack_payload(pairs: list[RoundTrip]) -> dict:
     route = f"{FROM_AIRPORT}↔{TO_AIRPORT}"
     dates = f"{DEPART_DATE} 去 / {RETURN_DATE} 回"
@@ -223,24 +235,26 @@ def build_slack_payload(pairs: list[RoundTrip]) -> dict:
     cheapest = pairs[0]
     hit = cheapest.total <= THRESHOLD
     ctag = f"〈{cheapest.tag}〉" if cheapest.tag else ""
+    cpp = f"（每人 NT${_per_person(cheapest.total):,}）" if PASSENGERS > 1 else ""
 
     if hit:
         head = (
             f":airplane: <!channel> *[{route}] 出現 NT${THRESHOLD:,} 以下的來回票！*\n"
-            f"最低來回合計 *NT${cheapest.total:,}* — {cheapest.airline}{ctag}"
+            f"最低來回合計 *NT${cheapest.total:,}* — {cheapest.airline}{ctag}{cpp}"
         )
     else:
         head = (
             f":airplane: [{route}] 來回機票監控\n"
-            f"目前最低來回合計 *NT${cheapest.total:,}* — {cheapest.airline}{ctag}"
+            f"目前最低來回合計 *NT${cheapest.total:,}* — {cheapest.airline}{ctag}{cpp}"
         )
 
     lines = [head, f"_{dates}・經濟艙・{pax}・金額為全體乘客來回合計_", ""]
     for i, rt in enumerate(pairs[:5], 1):
         tag = f"〈{rt.tag}〉" if rt.tag else ""
-        lines.append(f"{i}. *NT${rt.total:,}* — {rt.airline}{tag}")
-        lines.append(f"      去 {rt.outbound.detail}（NT${rt.outbound.price:,}）")
-        lines.append(f"      回 {rt.inbound.detail}（NT${rt.inbound.price:,}）")
+        pp = f"（每人 NT${_per_person(rt.total):,}）" if PASSENGERS > 1 else ""
+        lines.append(f"{i}. *NT${rt.total:,}* — {rt.airline}{tag}{pp}")
+        lines.append(f"      去 {rt.outbound.detail}（{_price_str(rt.outbound.price)}）")
+        lines.append(f"      回 {rt.inbound.detail}（{_price_str(rt.inbound.price)}）")
 
     lines.append("")
     lines.append("_※ 合計＝去程單程＋回程單程（廉航一次買單程即實付；傳統航空來回套票可能更便宜）。行李以訂票頁為準。_")
