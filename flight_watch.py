@@ -161,13 +161,31 @@ def _parse_entry(k) -> Itinerary | None:
     )
 
 
+def _diag(msg: str, html: str, script_text: str = "") -> str:
+    """組出診斷字串，讓 log / Slack 能看出是被擋還是格式變了。"""
+    low = html.lower()
+    markers = [m for m in ("consent", "captcha", "unusual traffic",
+                           "before you continue", "/sorry/", "recaptcha",
+                           "enablejs", "not a robot") if m in low]
+    return (f"{msg}｜HTML={len(html)}bytes markers={markers or 'none'} "
+            f"NT$={html.count('NT$')} TWD={html.count('TWD')} "
+            f"ds1_head={script_text[:200]!r}")
+
+
 def parse_itineraries(html: str) -> list[Itinerary]:
     parser = LexborHTMLParser(html)
     script = parser.css_first(r"script.ds\:1")
     if script is None:
-        raise RuntimeError("找不到 Google Flights 資料節點（可能被擋或改版）")
+        raise RuntimeError(_diag("找不到 ds:1 資料節點", html))
     text = script.text()
-    payload = json.loads(text.split("data:", 1)[1].rsplit(",", 1)[0])
+    if "data:" not in text:
+        raise RuntimeError(_diag("ds:1 內無 data: 段", html, text))
+    raw = text.split("data:", 1)[1].lstrip()
+    try:
+        # raw_decode 只吃第一個完整 JSON 值，忽略尾巴（, sideChannel 等），比 rsplit 穩健
+        payload, _ = json.JSONDecoder().raw_decode(raw)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(_diag(f"JSON 解析失敗:{e}", html, text)) from e
 
     results: list[Itinerary] = []
     # best 清單 payload[3][0] 與 其他 清單 payload[2][0] 都要看
