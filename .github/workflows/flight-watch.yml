@@ -26,5 +26,5 @@ jobs:
           PRICE_THRESHOLD: "13000"   # 最低來回合計(2人) <= 此值才 @channel
           PASSENGERS: "2"            # 乘客人數
           ALWAYS_POST: "1"           # 每小時都推一則（未達門檻走正常推播）
-          TOP_N: "7"                 # 最多列幾家
+          TOP_N: "4"                 # 最多列幾家
         run: python flight_watch.py

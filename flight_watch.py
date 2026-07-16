@@ -40,7 +40,7 @@ CURRENCY = "TWD"
 THRESHOLD = int(os.environ.get("PRICE_THRESHOLD", "13000"))  # 最低來回合計(全體乘客) <= 此值才推播
 # ALWAYS_POST=1 → 每次都推（未達門檻走正常推播）；預設 0 → 只有達門檻才推，未達安靜略過
 ALWAYS_POST = os.environ.get("ALWAYS_POST", "0").strip() in ("1", "true", "True")
-TOP_N = int(os.environ.get("TOP_N", "7"))  # 訊息最多列出幾家（依來回合計由低到高）
+TOP_N = int(os.environ.get("TOP_N", "4"))  # 訊息最多列出幾家（依來回合計由低到高）
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "").strip()
 
 # 廉航 / 傳統航空 關鍵字（用於判斷行李慣例，非即時資料）
@@ -215,6 +215,20 @@ def fetch_oneway(date: str, frm: str, to: str) -> list[Itinerary]:
     return parse_itineraries(fetch_flights_html(query))
 
 
+def fetch_roundtrip() -> list[Itinerary]:
+    """來回搜尋 → 去程班次清單，price 為 Google 給的「真實來回總價」（全體乘客）。
+    這才是使用者點進去實際會看到的來回票價（通常比去/回單程相加略低）。"""
+    query = create_query(
+        flights=[
+            FlightQuery(date=DEPART_DATE, from_airport=FROM_AIRPORT, to_airport=TO_AIRPORT),
+            FlightQuery(date=RETURN_DATE, from_airport=TO_AIRPORT, to_airport=FROM_AIRPORT),
+        ],
+        trip="round-trip", seat="economy", passengers=Passengers(adults=PASSENGERS),
+        language="zh-TW", currency=CURRENCY,
+    )
+    return parse_itineraries(fetch_flights_html(query))
+
+
 def _cheapest_by_airline(items: list[Itinerary]) -> dict[str, Itinerary]:
     """items 已依價格排序 → 每家航空取第一筆（最便宜）。"""
     best: dict[str, Itinerary] = {}
@@ -244,39 +258,48 @@ def _price_str(total: int) -> str:
     return f"NT${total:,}"
 
 
-def build_slack_payload(pairs: list[RoundTrip]) -> dict:
+def build_slack_payload(rt_cheapest: Itinerary | None, pairs: list[RoundTrip]) -> dict:
     route = f"{FROM_AIRPORT}↔{TO_AIRPORT}"
     dates = f"{DEPART_DATE} 去 / {RETURN_DATE} 回"
     pax = f"{PASSENGERS} 位成人"
-    if not pairs:
-        return {"text": f":warning: [{route}] {dates} 這次沒配對到任何來回（可能來源改版或暫時無結果）。"}
+    if rt_cheapest is None and not pairs:
+        return {"text": f":warning: [{route}] {dates} 這次沒抓到任何票價（可能來源改版或暫時無結果）。"}
 
-    cheapest = pairs[0]
-    hit = cheapest.total <= THRESHOLD
-    ctag = f"〈{cheapest.tag}〉" if cheapest.tag else ""
-    cpp = f"（每人 NT${_per_person(cheapest.total):,}）" if PASSENGERS > 1 else ""
+    # 頭條：優先用「真來回票價」（Google 來回搜尋），抓不到才退回單程相加
+    if rt_cheapest is not None:
+        hp, h_air, h_tag = rt_cheapest.price, rt_cheapest.airline_label, carrier_tag(rt_cheapest.airline_label)
+        label = "真來回最低票價"
+    else:
+        hp, h_air, h_tag = pairs[0].total, pairs[0].airline, pairs[0].tag
+        label = "最低來回合計(單程相加)"
+
+    hit = hp <= THRESHOLD
+    htag = f"〈{h_tag}〉" if h_tag else ""
+    hpp = f"（每人 NT${_per_person(hp):,}）" if PASSENGERS > 1 else ""
 
     if hit:
         head = (
             f":airplane: <!channel> *[{route}] 出現 NT${THRESHOLD:,} 以下的來回票！*\n"
-            f"最低來回合計 *NT${cheapest.total:,}* — {cheapest.airline}{ctag}{cpp}"
+            f"{label} *NT${hp:,}* — {h_air}{htag}{hpp}"
         )
     else:
         head = (
             f":airplane: [{route}] 來回機票監控\n"
-            f"目前最低來回合計 *NT${cheapest.total:,}* — {cheapest.airline}{ctag}{cpp}"
+            f"目前{label} *NT${hp:,}* — {h_air}{htag}{hpp}"
         )
 
-    lines = [head, f"_{dates}・經濟艙・{pax}・金額為全體乘客來回合計_", ""]
-    for i, rt in enumerate(pairs[:TOP_N], 1):
-        tag = f"〈{rt.tag}〉" if rt.tag else ""
-        pp = f"（每人 NT${_per_person(rt.total):,}）" if PASSENGERS > 1 else ""
-        lines.append(f"{i}. *NT${rt.total:,}* — {rt.airline}{tag}{pp}")
-        lines.append(f"      去 {rt.outbound.detail}（{_price_str(rt.outbound.price)}）")
-        lines.append(f"      回 {rt.inbound.detail}（{_price_str(rt.inbound.price)}）")
+    lines = [head, f"_{dates}・經濟艙・{pax}_", ""]
+    if pairs:
+        lines.append("*各家去/回時段參考*（合計＝去單程＋回單程，通常略高於真來回票）")
+        for i, rt in enumerate(pairs[:TOP_N], 1):
+            tag = f"〈{rt.tag}〉" if rt.tag else ""
+            pp = f"（每人 NT${_per_person(rt.total):,}）" if PASSENGERS > 1 else ""
+            lines.append(f"{i}. *NT${rt.total:,}* — {rt.airline}{tag}{pp}")
+            lines.append(f"      去 {rt.outbound.detail}（{_price_str(rt.outbound.price)}）")
+            lines.append(f"      回 {rt.inbound.detail}（{_price_str(rt.inbound.price)}）")
 
     lines.append("")
-    lines.append("_※ 合計＝去程單程＋回程單程（廉航一次買單程即實付；傳統航空來回套票可能更便宜）。行李以訂票頁為準。_")
+    lines.append("_※ 頭條為 Google 來回搜尋的實際最低票價；下方合計為去/回單程相加、僅供比對時段（通常略高）。行李以訂票頁為準。_")
 
     gf_url = (
         "https://www.google.com/travel/flights?q="
@@ -304,24 +327,36 @@ def post_to_slack(payload: dict) -> None:
 
 
 def main() -> int:
+    # 來回搜尋（頭條/門檻依據）——失敗不致命，退回用單程相加當頭條
+    try:
+        rt = fetch_roundtrip()
+    except Exception as e:
+        print(f"WARN: 來回搜尋失敗，改用單程相加當頭條：{e}", file=sys.stderr)
+        rt = []
+    # 去/回單程（下方時段明細用）
     try:
         outbound = fetch_oneway(DEPART_DATE, FROM_AIRPORT, TO_AIRPORT)
         inbound = fetch_oneway(RETURN_DATE, TO_AIRPORT, FROM_AIRPORT)
-    except Exception as e:  # 抓取失敗也推一則，避免默默失效
-        post_to_slack({"text": f":x: 機票監控執行失敗：{type(e).__name__}: {e}"})
-        print(f"ERROR: {e}", file=sys.stderr)
-        return 1
+    except Exception as e:
+        outbound, inbound = [], []
+        if not rt:  # 來回也沒 → 真的失敗，推錯誤
+            post_to_slack({"text": f":x: 機票監控執行失敗：{type(e).__name__}: {e}"})
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 1
+        print(f"WARN: 單程明細抓取失敗（僅顯示頭條）：{e}", file=sys.stderr)
 
     pairs = pair_roundtrips(outbound, inbound)
-    if not pairs:  # 沒配對到 → 推警告（可能來源改版）
-        post_to_slack(build_slack_payload(pairs))
+    rt_cheapest = rt[0] if rt else None
+
+    if rt_cheapest is None and not pairs:  # 什麼都沒抓到 → 推警告
+        post_to_slack(build_slack_payload(rt_cheapest, pairs))
         return 0
 
-    cheapest = pairs[0]
-    if cheapest.total <= THRESHOLD or ALWAYS_POST:
-        post_to_slack(build_slack_payload(pairs))
+    headline = rt_cheapest.price if rt_cheapest is not None else pairs[0].total
+    if headline <= THRESHOLD or ALWAYS_POST:
+        post_to_slack(build_slack_payload(rt_cheapest, pairs))
     else:  # 未達門檻且非 ALWAYS_POST → 安靜略過，只留 log
-        print(f"[skip] 最低來回合計 NT${cheapest.total:,} > 門檻 NT${THRESHOLD:,}，不推播")
+        print(f"[skip] 最低票價 NT${headline:,} > 門檻 NT${THRESHOLD:,}，不推播")
     return 0
 
 
